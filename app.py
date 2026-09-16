@@ -5,7 +5,7 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="مراقب استراتيجية فيصل", page_icon="📈", layout="centered")
+st.set_page_config(page_title="مراقب استراتيجية", page_icon="📈", layout="centered")
 
 # ============================================================
 # تنسيق عام (RTL + ألوان ثابتة تشتغل بأي وضع - فاتح أو غامق)
@@ -77,23 +77,63 @@ def safe_last_close(df: pd.DataFrame):
 
 
 def fetch_iborrowdesk(ticker: str):
+    """يحاول جلب بيانات الاستعارة من IBorrowDesk. يرجع (data, error_message).
+    data يكون None لو فشل، مع رسالة تشرح السبب بدال ما نسكت عن الخطأ."""
     url = f"https://iborrowdesk.com/api/ticker/{ticker}"
     try:
         resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            return None
+    except Exception as e:
+        return None, f"تعذر الاتصال بـ IBorrowDesk: {e}"
+
+    if resp.status_code == 404:
+        return None, "الرمز غير موجود على IBorrowDesk (غالبًا يدعم أسهم أمريكية فقط)."
+    if resp.status_code != 200:
+        return None, f"IBorrowDesk رجع خطأ HTTP {resp.status_code}."
+
+    try:
         data = resp.json()
-        daily = data.get("daily") or data.get("data") or []
-        if not daily:
-            return None
-        latest = daily[-1]
-        return {
-            "fee": latest.get("fee"),
-            "available": latest.get("available"),
-            "date": latest.get("time") or latest.get("date"),
-        }
+    except Exception:
+        return None, "استجابة IBorrowDesk ما كانت بصيغة JSON صالحة (ممكن يكون الموقع غيّر شكل الـ API)."
+
+    # نجرب أكثر من مسار محتمل لهيكلة البيانات لأن الـ API غير موثّق رسميًا
+    daily = None
+    if isinstance(data, dict):
+        daily = data.get("daily") or data.get("data") or data.get("results")
+    elif isinstance(data, list):
+        daily = data
+
+    if not daily:
+        return None, "ما فيه بيانات استعارة مسجلة لهذا الرمز بـ IBorrowDesk."
+
+    latest = daily[-1]
+    fee = latest.get("fee") if isinstance(latest, dict) else None
+    available = latest.get("available") if isinstance(latest, dict) else None
+    date = (latest.get("time") or latest.get("date")) if isinstance(latest, dict) else None
+
+    if fee is None and available is None:
+        return None, "الحقول المتوقعة (fee / available) غير موجودة برد IBorrowDesk."
+
+    return {"fee": fee, "available": available, "date": date}, None
+
+
+def fetch_yahoo_short_data(ticker_obj):
+    """مصدر بديل موثوق من Yahoo Finance (نفس مكتبة yfinance المستخدمة أصلًا).
+    يعطي بيانات الفائدة القصيرة (Short Interest) وهي مو مطابقة 100% لرسوم
+    الاستعارة اليومية من IBorrowDesk، لكنها مؤشر بديل مفيد ومتوفر بثبات أكبر."""
+    try:
+        info = ticker_obj.info
     except Exception:
         return None
+    fields = {
+        "sharesShort": info.get("sharesShort"),
+        "shortRatio": info.get("shortRatio"),
+        "shortPercentOfFloat": info.get("shortPercentOfFloat"),
+        "sharesShortPriorMonth": info.get("sharesShortPriorMonth"),
+        "dateShortInterest": info.get("dateShortInterest"),
+    }
+    if all(v is None for v in fields.values()):
+        return None
+    return fields
 
 
 def compute_rsi(close: pd.Series, period: int = 14):
@@ -365,15 +405,15 @@ if run and ticker_input:
                         val = latest[f'EMA{p}']
                         st.write(f"EMA{p}: {val:.3f} — {'السعر تحته ✓' if ema_status[p] else 'السعر فوقه ✗'}")
 
-            # ---------- بيانات IBorrowDesk ----------
-            st.subheader("بيانات الاستعارة (Short) — IBorrowDesk")
-            ib_data = fetch_iborrowdesk(ticker_input)
-            if ib_data is None:
-                st.markdown('<span class="badge-grey">ما قدرت أجيب بيانات IBorrowDesk لهذا الرمز</span>', unsafe_allow_html=True)
-            else:
+            # ---------- بيانات الاستعارة (Short) ----------
+            st.subheader("بيانات الاستعارة (Short)")
+            ib_data, ib_error = fetch_iborrowdesk(ticker_input)
+
+            if ib_data is not None:
                 fee = ib_data.get("fee")
                 available = ib_data.get("available")
                 date_txt = ib_data.get("date") or "—"
+                st.caption("المصدر: IBorrowDesk")
                 ic1, ic2 = st.columns(2)
                 with ic1:
                     st.metric("نسبة رسوم الاستعارة (Fee)", f"{fee}%" if fee is not None else "—")
@@ -388,6 +428,34 @@ if run and ticker_input:
                         st.markdown('<span class="badge-orange">رسوم استعارة مرتفعة نسبيًا</span>', unsafe_allow_html=True)
                     else:
                         st.markdown('<span class="badge-green">رسوم استعارة منخفضة</span>', unsafe_allow_html=True)
+            else:
+                # نعرض سبب فشل IBorrowDesk بدل ما نسكت عنه، وننتقل لمصدر بديل
+                st.markdown(f'<span class="badge-grey">IBorrowDesk: {ib_error}</span>', unsafe_allow_html=True)
+
+                yahoo_short = fetch_yahoo_short_data(ticker_obj)
+                if yahoo_short is None:
+                    st.markdown('<span class="badge-grey">ولا المصدر البديل (Yahoo Finance) عنده بيانات استعارة لهذا الرمز.</span>', unsafe_allow_html=True)
+                else:
+                    st.caption("المصدر البديل: Yahoo Finance (بيانات الفائدة القصيرة — Short Interest، مو نفس رسوم الاستعارة اليومية بالضبط)")
+                    yc1, yc2 = st.columns(2)
+                    with yc1:
+                        ss = yahoo_short.get("sharesShort")
+                        st.metric("الأسهم المباعة على المكشوف", f"{ss:,}" if isinstance(ss, (int, float)) else "—")
+                    with yc2:
+                        spf = yahoo_short.get("shortPercentOfFloat")
+                        spf_txt = f"{spf*100:.2f}%" if isinstance(spf, (int, float)) else "—"
+                        st.metric("النسبة من الأسهم المتاحة للتداول (Float)", spf_txt)
+                    yc3, yc4 = st.columns(2)
+                    with yc3:
+                        sr = yahoo_short.get("shortRatio")
+                        st.metric("نسبة أيام التغطية (Short Ratio)", f"{sr:.2f}" if isinstance(sr, (int, float)) else "—")
+                    with yc4:
+                        dsi = yahoo_short.get("dateShortInterest")
+                        if isinstance(dsi, (int, float)):
+                            dsi_txt = datetime.fromtimestamp(dsi).strftime("%Y-%m-%d")
+                        else:
+                            dsi_txt = "—"
+                        st.metric("تاريخ آخر تحديث", dsi_txt)
 
             with st.expander("عرض البيانات اليومية الخام"):
                 st.dataframe(daily.tail(30))
